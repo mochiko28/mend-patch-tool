@@ -25,6 +25,8 @@ class Fail {
 }
 
 const blank = (s: string): boolean => s.trim() === '';
+/** SPEC.md says "surrounding spaces removed" for these paths and anchors: spaces only, not tabs. */
+const trimSpaces = (s: string): string => s.replace(/^ +| +$/g, '');
 
 function patchLines(text: string): string[] {
   if (text === '') return [];
@@ -230,7 +232,7 @@ interface UnifiedSection {
 }
 
 function diffHeaderPath(line: string): string | null {
-  const path = line.slice(4).split('\t', 1)[0]!.trim();
+  const path = trimSpaces(line.slice(4).split('\t', 1)[0]!);
   return path === '/dev/null' ? null : path.replace(/^[ab]\//, '');
 }
 
@@ -288,7 +290,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
   let section: UnifiedSection | undefined;
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i]!;
-    if (/^diff --git(?:[ \t]|$)/.test(line)) {
+    if (line.startsWith('diff --git ')) {
       const paths = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
       if (paths === null) parseError(i);
       section = { gitPaths: [paths[1]!, paths[2]!], hunks: [] };
@@ -330,14 +332,14 @@ interface V4aChunk extends LineChange {
 function v4aUpdate(lines: string[], start: number, end: number, path: string, strict: boolean): Edit {
   const movePrefix = '*** Move to: ';
   const hasMove = start + 1 < end && lines[start + 1]!.startsWith(movePrefix);
-  const to = hasMove ? lines[start + 1]!.slice(movePrefix.length).trim() : path;
+  const to = hasMove ? trimSpaces(lines[start + 1]!.slice(movePrefix.length)) : path;
   const chunks: V4aChunk[] = [];
   let i = start + (hasMove ? 2 : 1);
   const isBody = (line: string): boolean => line === '' || /^[ +-]/.test(line);
   while (i < end) {
     let anchor = '';
     if (lines[i]!.startsWith('@@')) {
-      anchor = lines[i]!.slice(2).trim();
+      anchor = trimSpaces(lines[i]!.slice(2));
       i += 1;
     } else if (chunks.length > 0 || !isBody(lines[i]!)) parseError(i);
     const bodyStart = i;
@@ -390,7 +392,7 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
     }
     const header = sectionHeader.exec(lines[i]!);
     if (header === null) parseError(i);
-    const path = lines[i]!.slice(header[0].length).trim();
+    const path = trimSpaces(lines[i]!.slice(header[0].length));
     let next = i + 1;
     while (next < last && !sectionHeader.test(lines[next]!)) next += 1;
     let end = next;
