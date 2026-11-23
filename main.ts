@@ -4,8 +4,8 @@
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
 
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
 
@@ -39,18 +39,28 @@ function safe(p: string): boolean {
   return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
 }
 
+function invalidFilesystemPath(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === 'ENAMETOOLONG' || code === 'ERR_INVALID_ARG_VALUE';
+}
+
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
 class Tree {
   private readonly orig = new Map<string, string | null>();
+  private readonly originalDirectories = new Set<string>();
+  private readonly createdDirectories = new Set<string>();
+  private readonly invalidPaths = new Set<string>();
   readonly now = new Map<string, string | null>();
   readonly moves: { from: string; to: string }[] = [];
   original(p: string): string | null {
     if (!this.orig.has(p)) {
       let v: string | null = null;
       try {
-        if (statSync(p).isFile()) v = readFileSync(p, 'utf8');
-      } catch {
-        v = null;
+        const stat = statSync(p);
+        if (stat.isFile()) v = readFileSync(p, 'utf8');
+        else if (stat.isDirectory()) this.originalDirectories.add(p);
+      } catch (error) {
+        if (invalidFilesystemPath(error)) this.invalidPaths.add(p);
       }
       this.orig.set(p, v);
     }
@@ -58,6 +68,40 @@ class Tree {
   }
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
+  }
+
+  requireAbsent(p: string, movingFrom?: string): void {
+    if (this.get(p) !== null || this.originalDirectories.has(p) || this.createdDirectories.has(p)) {
+      throw new Fail('exists', p);
+    }
+    if (this.invalidPaths.has(p)) throw new Fail('unsafe', p);
+
+    const names = [basename(p)];
+    let parent = dirname(p);
+    while (parent !== '.') {
+      if (parent !== movingFrom && this.get(parent) !== null) throw new Fail('exists', parent);
+      if (this.originalDirectories.has(parent)) break;
+      names.push(basename(parent));
+      parent = dirname(parent);
+    }
+    if (names.length === 1) return;
+
+    // A missing directory can hide an invalid name from the full-path lookup.
+    // Check those names in the nearest on-disk directory, on the same filesystem.
+    for (const name of names) {
+      try {
+        lstatSync(join(parent, name), { throwIfNoEntry: false });
+      } catch (error) {
+        if (invalidFilesystemPath(error)) throw new Fail('unsafe', p);
+      }
+    }
+  }
+
+  write(p: string, text: string): void {
+    this.now.set(p, text);
+    for (let parent = dirname(p); parent !== '.'; parent = dirname(parent)) {
+      this.createdDirectories.add(parent);
+    }
   }
 }
 
@@ -88,12 +132,8 @@ function existingText(tree: Tree, path: string): string {
   return text;
 }
 
-function requireAbsent(tree: Tree, path: string): void {
-  if (tree.get(path) !== null) throw new Fail('exists', path);
-}
-
 function saveEdit(tree: Tree, from: string, to: string, text: string): void {
-  tree.now.set(to, text);
+  tree.write(to, text);
   if (from !== to) {
     tree.now.set(from, null);
     tree.moves.push({ from, to });
@@ -197,8 +237,8 @@ function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
     edits.push((tree) => {
       checkPath(path);
       if (old.length === 0) {
-        requireAbsent(tree, path);
-        tree.now.set(path, joinFile(replacement));
+        tree.requireAbsent(path);
+        tree.write(path, joinFile(replacement));
         return;
       }
       const file = splitFile(existingText(tree, path));
@@ -250,9 +290,9 @@ function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
     if (from === null || section.create) {
       const path = to ?? '';
       checkPath(path);
-      requireAbsent(tree, path);
+      tree.requireAbsent(path);
       const additions = section.hunks.flatMap((hunk) => hunk.replacement.filter((line) => line.context === undefined));
-      tree.now.set(path, joinFile(additions.map((line) => line.text), '\n', !additions.at(-1)?.noNewline));
+      tree.write(path, joinFile(additions.map((line) => line.text), '\n', !additions.at(-1)?.noNewline));
       return;
     }
     const before = existingText(tree, from);
@@ -260,7 +300,7 @@ function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
       tree.now.set(from, null);
       return;
     }
-    if (from !== to) requireAbsent(tree, to);
+    if (from !== to) tree.requireAbsent(to, from);
     const file = splitFile(before);
     let delta = 0;
     for (const hunk of section.hunks) {
@@ -290,8 +330,8 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
   let section: UnifiedSection | undefined;
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i]!;
-    if (line.startsWith('diff --git ')) {
-      const paths = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    if (/^diff --git(?:\s|$)/.test(line)) {
+      const paths = /^diff --git a\/(.+?) b\/(.+)$/s.exec(line);
       if (paths === null) parseError(i);
       section = { gitPaths: [paths[1]!, paths[2]!], hunks: [] };
       sections.push(section);
@@ -353,7 +393,7 @@ function v4aUpdate(lines: string[], start: number, end: number, path: string, st
     checkPath(path);
     if (hasMove) checkPath(to);
     const file = splitFile(existingText(tree, path));
-    if (hasMove) requireAbsent(tree, to);
+    if (hasMove) tree.requireAbsent(to, path);
     let cursor = 0;
     for (const chunk of chunks) {
       if (chunk.anchor !== '') {
@@ -406,8 +446,8 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
       }
       edits.push((tree) => {
         checkPath(path);
-        requireAbsent(tree, path);
-        tree.now.set(path, joinFile(added));
+        tree.requireAbsent(path);
+        tree.write(path, joinFile(added));
       });
     } else if (header[1] === 'Delete') {
       if (end > i + 1) parseError(i + 1);
@@ -437,9 +477,9 @@ function jsonEdit(v: unknown): Edit | null {
   if (o.command === 'create' && typeof o.file_text === 'string') {
     const text = o.file_text;
     return (tree) => {
-      if (!safe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
-      tree.now.set(p, text);
+      checkPath(p);
+      tree.requireAbsent(p);
+      tree.write(p, text);
     };
   }
   if (o.command === 'str_replace' && typeof o.old_str === 'string' && o.old_str !== '' && (o.new_str === undefined || typeof o.new_str === 'string')) {
@@ -465,15 +505,10 @@ function jsonEdit(v: unknown): Edit | null {
     const line = o.insert_line;
     const add = patchLines(o.new_str);
     return (tree) => {
-      const before = exists(tree);
-      const nl = before.indexOf('\n');
-      const br = nl > 0 && before[nl - 1] === '\r' ? '\r\n' : '\n';
-      const lines = before === '' ? [] : before.split(br);
-      const final = before !== '' && before.endsWith(br);
-      if (final) lines.pop();
+      const { lines, br, finalBreak } = splitFile(exists(tree));
       if (line < 0 || line > lines.length) throw new Fail('no-match', p);
-      lines.splice(line, 0, ...add);
-      tree.now.set(p, lines.length === 0 ? '' : lines.join(br) + (final ? br : ''));
+      const result = lines.slice(0, line).concat(add, lines.slice(line));
+      tree.now.set(p, joinFile(result, br, finalBreak));
     };
   }
   return null;
