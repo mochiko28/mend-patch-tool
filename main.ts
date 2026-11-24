@@ -50,7 +50,7 @@ class Tree {
   private readonly originalDirectories = new Set<string>();
   private readonly createdDirectories = new Set<string>();
   private readonly invalidPaths = new Set<string>();
-  readonly now = new Map<string, string | null>();
+  readonly now = new Map<string, string | JsonLineText | null>();
   readonly moves: { from: string; to: string }[] = [];
   original(p: string): string | null {
     if (!this.orig.has(p)) {
@@ -67,6 +67,9 @@ class Tree {
     return this.orig.get(p)!;
   }
   get(p: string): string | null {
+    return this.content(p)?.toString() ?? null;
+  }
+  content(p: string): string | JsonLineText | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
   }
 
@@ -140,13 +143,23 @@ function saveEdit(tree: Tree, from: string, to: string, text: string): void {
   }
 }
 
-function splitFile(text: string): { lines: string[]; br: string; finalBreak: boolean } {
+type LineIndex = Map<string, Set<number>>;
+
+interface SplitFile {
+  lines: string[];
+  br: string;
+  finalBreak: boolean;
+  normalized?: [(string | undefined)[]?, (string | undefined)[]?];
+  indexes?: LineIndex[];
+}
+
+function splitFile(text: string, indexMatches = false): SplitFile {
   const nl = text.indexOf('\n');
   const br = nl > 0 && text[nl - 1] === '\r' ? '\r\n' : '\n';
   const finalBreak = text.endsWith(br);
   const lines = text === '' ? [] : text.split(br);
   if (finalBreak) lines.pop();
-  return { lines, br, finalBreak };
+  return { lines, br, finalBreak, indexes: indexMatches ? [] : undefined };
 }
 
 function joinFile(lines: string[], br = '\n', finalBreak = true): string {
@@ -156,19 +169,62 @@ function joinFile(lines: string[], br = '\n', finalBreak = true): string {
 const leadingIndent = (line: string): string => /^[ \t]*/.exec(line)![0];
 const trimTrailing = (line: string): string => line.replace(/[ \t]+$/, '');
 const trimIndent = (line: string): string => trimTrailing(line.slice(leadingIndent(line).length));
+const lineNormalizers = [(line: string) => line, trimTrailing, trimIndent];
+
+function addLinePosition(index: LineIndex, line: string, at: number): void {
+  let positions = index.get(line);
+  if (positions === undefined) {
+    positions = new Set();
+    index.set(line, positions);
+  }
+  positions.add(at);
+}
+
+function moveLinePosition(index: LineIndex, before: string, after: string, at: number): void {
+  if (before === after) return;
+  const positions = index.get(before)!;
+  positions.delete(at);
+  if (positions.size === 0) index.delete(before);
+  addLinePosition(index, after, at);
+}
 
 function findMatches(
-  lines: string[], old: string[], strict: boolean, start = 0, end = lines.length - old.length,
+  file: SplitFile, old: string[], strict: boolean, start = 0, end = file.lines.length - old.length,
 ): { positions: number[]; tier: number } | null {
   if (start > end) return null;
-  const normalizers = [(line: string) => line, trimTrailing, trimIndent];
-  for (let tier = 0; tier < (strict ? 1 : normalizers.length); tier += 1) {
-    const normalize = normalizers[tier]!;
-    const before = tier === 0 ? lines : lines.map(normalize);
-    const wanted = old.map(normalize);
+  const { lines } = file;
+  for (let tier = 0; tier < (strict ? 1 : lineNormalizers.length); tier += 1) {
+    const normalize = lineNormalizers[tier]!;
+    const cache = tier === 0 ? undefined : (file.normalized ??= []);
+    const before = cache === undefined ? lines : (cache[tier - 1] ??= new Array<string | undefined>(lines.length));
+    const wanted = tier === 0 ? old : old.map(normalize);
+    const first = wanted[0];
     const positions: number[] = [];
-    for (let at = start; at <= end; at += 1) {
-      if (wanted.every((line, offset) => line === before[at + offset])) positions.push(at);
+    const matchesRest = (at: number): boolean => {
+      for (let offset = 1; offset < wanted.length; offset += 1) {
+        const i = at + offset;
+        if (wanted[offset] !== (before[i] ?? (before[i] = normalize(lines[i]!)))) return false;
+      }
+      return true;
+    };
+    if (file.indexes !== undefined && first !== undefined) {
+      let index = file.indexes[tier];
+      if (index === undefined) {
+        index = new Map();
+        for (let i = 0; i < lines.length; i += 1) {
+          addLinePosition(index, before[i] ?? (before[i] = normalize(lines[i]!)), i);
+        }
+        file.indexes[tier] = index;
+      }
+      for (const at of index.get(first) ?? []) {
+        if (at >= start && at <= end && matchesRest(at)) positions.push(at);
+      }
+      positions.sort((a, b) => a - b);
+    } else {
+      for (let at = start; at <= end; at += 1) {
+        if (first !== undefined && first !== (before[at] ?? (before[at] = normalize(lines[at]!)))) continue;
+        if (matchesRest(at)) positions.push(at);
+      }
     }
     if (positions.length > 0) return { positions, tier };
   }
@@ -203,7 +259,8 @@ function readLineChange(lines: string[], start: number, end: number): LineChange
   return { old, replacement };
 }
 
-function replaceLines(lines: string[], change: LineChange, at: number, tier: number): string[] {
+function replaceLines(file: SplitFile, change: LineChange, at: number, tier: number): void {
+  const { lines, normalized } = file;
   const fileIndent = tier === 2 ? leadingIndent(lines[at]!) : '';
   const patchIndent = tier === 2 ? leadingIndent(change.old[0]!) : '';
   const written = change.replacement.map(({ text, context }) => {
@@ -213,7 +270,35 @@ function replaceLines(lines: string[], change: LineChange, at: number, tier: num
     }
     return text;
   });
-  return lines.slice(0, at).concat(written, lines.slice(at + change.old.length));
+  if (file.indexes !== undefined) {
+    for (let tier = 0; tier < file.indexes.length; tier += 1) {
+      const index = file.indexes[tier]!;
+      const normalize = lineNormalizers[tier]!;
+      for (let offset = 0; offset < written.length; offset += 1) {
+        const i = at + offset;
+        if (lines[i] === written[offset]) continue;
+        moveLinePosition(index, normalize(lines[i]!), normalize(written[offset]!), i);
+      }
+    }
+  }
+  // Limit spread arguments even when an edit inserts a very large block.
+  const batchSize = 16384;
+  lines.splice(at, change.old.length, ...written.slice(0, batchSize));
+  for (let offset = batchSize; offset < written.length; offset += batchSize) {
+    lines.splice(at + offset, 0, ...written.slice(offset, offset + batchSize));
+  }
+  if (normalized !== undefined) {
+    for (const cache of normalized) {
+      if (cache === undefined) continue;
+      if (written.length === change.old.length) cache.fill(undefined, at, at + written.length);
+      else cache.length = at;
+    }
+  }
+}
+
+function indexBatch(changes: LineChange[]): boolean {
+  // Only build indexes when enough searches can reuse stable line positions.
+  return changes.length >= 16 && changes.every((change) => change.old.length === change.replacement.length);
 }
 
 function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
@@ -242,11 +327,11 @@ function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
         return;
       }
       const file = splitFile(existingText(tree, path));
-      const match = findMatches(file.lines, old, strict);
+      const match = findMatches(file, old, strict);
       if (match === null) throw new Fail('no-match', path);
       if (match.positions.length > 1) throw new Fail('ambiguous', path);
-      const result = replaceLines(file.lines, change, match.positions[0]!, match.tier);
-      tree.now.set(path, joinFile(result, file.br, file.finalBreak));
+      replaceLines(file, change, match.positions[0]!, match.tier);
+      tree.now.set(path, joinFile(file.lines, file.br, file.finalBreak));
     });
     previousPath = path;
     candidate = undefined;
@@ -301,14 +386,14 @@ function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
       return;
     }
     if (from !== to) tree.requireAbsent(to, from);
-    const file = splitFile(before);
+    const file = splitFile(before, indexBatch(section.hunks));
     let delta = 0;
     for (const hunk of section.hunks) {
       const { old, replacement } = hunk;
       let at = Math.max(0, Math.min(file.lines.length, hunk.start + delta));
       let tier = 0;
       if (old.length > 0) {
-        const match = findMatches(file.lines, old, strict);
+        const match = findMatches(file, old, strict);
         if (match === null) throw new Fail('no-match', from);
         const target = Math.max(0, Math.min(file.lines.length, hunk.start - 1 + delta));
         at = match.positions[0]!;
@@ -318,7 +403,7 @@ function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
         tier = match.tier;
       }
       if (at + old.length === file.lines.length) file.finalBreak = !replacement.at(-1)?.noNewline;
-      file.lines = replaceLines(file.lines, hunk, at, tier);
+      replaceLines(file, hunk, at, tier);
       delta += replacement.length - old.length;
     }
     saveEdit(tree, from, to, joinFile(file.lines, file.br, file.finalBreak));
@@ -392,12 +477,12 @@ function v4aUpdate(lines: string[], start: number, end: number, path: string, st
   return (tree) => {
     checkPath(path);
     if (hasMove) checkPath(to);
-    const file = splitFile(existingText(tree, path));
+    const file = splitFile(existingText(tree, path), indexBatch(chunks));
     if (hasMove) tree.requireAbsent(to, path);
     let cursor = 0;
     for (const chunk of chunks) {
       if (chunk.anchor !== '') {
-        const match = findMatches(file.lines, [chunk.anchor], strict, cursor);
+        const match = findMatches(file, [chunk.anchor], strict, cursor);
         if (match === null) throw new Fail('no-match', path);
         cursor = match.positions[0]! + 1;
       }
@@ -405,12 +490,12 @@ function v4aUpdate(lines: string[], start: number, end: number, path: string, st
       let tier = 0;
       if (chunk.old.length > 0) {
         const lastStart = file.lines.length - chunk.old.length;
-        const match = findMatches(file.lines, chunk.old, strict, chunk.eof ? Math.max(cursor, lastStart) : cursor, lastStart);
+        const match = findMatches(file, chunk.old, strict, chunk.eof ? Math.max(cursor, lastStart) : cursor, lastStart);
         if (match === null) throw new Fail('no-match', path);
         at = match.positions[0]!;
         tier = match.tier;
       }
-      file.lines = replaceLines(file.lines, chunk, at, tier);
+      replaceLines(file, chunk, at, tier);
       cursor = at + chunk.replacement.length;
     }
     saveEdit(tree, path, to, joinFile(file.lines, file.br, file.finalBreak));
@@ -462,15 +547,51 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
   return edits;
 }
 
+const jsonSuffixLength = 4;
+
+// In LF text, a search with exactly one newline at its end can only match a line suffix.
+class JsonLineText {
+  private readonly lines: string[];
+  private readonly suffixes: LineIndex = new Map();
+
+  constructor(text: string) {
+    this.lines = text.split('\n');
+    for (let i = 0; i < this.lines.length - 1; i += 1) {
+      addLinePosition(this.suffixes, this.lines[i]!.slice(-jsonSuffixLength), i);
+    }
+  }
+
+  replace(path: string, oldSuffix: string, newSuffix: string): void {
+    const key = oldSuffix.slice(-jsonSuffixLength);
+    let at: number | undefined;
+    for (const i of this.suffixes.get(key) ?? []) {
+      if (!this.lines[i]!.endsWith(oldSuffix)) continue;
+      if (at !== undefined) throw new Fail('ambiguous', path);
+      at = i;
+    }
+    if (at === undefined) throw new Fail('no-match', path);
+
+    // Validate uniqueness before changing the text that the tree shares with its rollback snapshot.
+    const line = this.lines[at]!;
+    const written = line.slice(0, line.length - oldSuffix.length) + newSuffix;
+    this.lines[at] = written;
+    moveLinePosition(this.suffixes, key, written.slice(-jsonSuffixLength), at);
+  }
+
+  toString(): string {
+    return this.lines.join('\n');
+  }
+}
+
 /** One JSON edit object (SPEC.md section 9), or null when it is not one. */
 function jsonEdit(v: unknown): Edit | null {
   if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
   const p = o.path;
   if (typeof p !== 'string') return null;
-  const exists = (tree: Tree): string => {
+  const exists = (tree: Tree): string | JsonLineText => {
     if (!safe(p)) throw new Fail('unsafe', p);
-    const t = tree.get(p);
+    const t = tree.content(p);
     if (t === null) throw new Fail('missing', p);
     return t;
   };
@@ -485,18 +606,28 @@ function jsonEdit(v: unknown): Edit | null {
   if (o.command === 'str_replace' && typeof o.old_str === 'string' && o.old_str !== '' && (o.new_str === undefined || typeof o.new_str === 'string')) {
     const oldStr = o.old_str;
     const newStr = (o.new_str as string | undefined) ?? '';
+    const replaceSuffix = oldStr.length > jsonSuffixLength && oldStr.indexOf('\n') === oldStr.length - 1
+      && newStr.endsWith('\n') && newStr.indexOf('\n') === newStr.length - 1 && !newStr.includes('\r');
     return (tree) => {
-      const before = exists(tree);
+      const content = exists(tree);
+      if (replaceSuffix) {
+        const indexed = typeof content !== 'string' ? content
+          : content.length >= 65536 && !content.includes('\r') ? new JsonLineText(content) : undefined;
+        if (indexed !== undefined) {
+          indexed.replace(p, oldStr.slice(0, -1), newStr.slice(0, -1));
+          tree.now.set(p, indexed);
+          return;
+        }
+      }
+      const before = content.toString();
       const nl = before.indexOf('\n');
       const crlf = nl > 0 && before[nl - 1] === '\r';
       const lf = (s: string): string => (crlf ? s.replaceAll('\r\n', '\n') : s);
       const t = lf(before);
       const old = lf(oldStr);
-      let count = 0;
-      for (let k = t.indexOf(old); k >= 0; k = t.indexOf(old, k + 1)) count += 1;
-      if (count === 0) throw new Fail('no-match', p);
-      if (count > 1) throw new Fail('ambiguous', p);
       const at = t.indexOf(old);
+      if (at < 0) throw new Fail('no-match', p);
+      if (t.indexOf(old, at + 1) >= 0) throw new Fail('ambiguous', p);
       const out = t.slice(0, at) + lf(newStr) + t.slice(at + old.length);
       tree.now.set(p, crlf ? out.replaceAll('\n', '\r\n') : out);
     };
@@ -505,7 +636,7 @@ function jsonEdit(v: unknown): Edit | null {
     const line = o.insert_line;
     const add = patchLines(o.new_str);
     return (tree) => {
-      const { lines, br, finalBreak } = splitFile(exists(tree));
+      const { lines, br, finalBreak } = splitFile(exists(tree).toString());
       if (line < 0 || line > lines.length) throw new Fail('no-match', p);
       const result = lines.slice(0, line).concat(add, lines.slice(line));
       tree.now.set(p, joinFile(result, br, finalBreak));
@@ -613,7 +744,7 @@ function run(args: string[]): { code: number; out: string[] } {
   const rows: string[] = [];
   for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
     const was = tree.original(p);
-    const now = tree.now.get(p)!;
+    const now = tree.get(p);
     if (was === now) continue;
     const from = renamedTo.get(p);
     if (from !== undefined) rows.push(`R ${from} -> ${p}`);
