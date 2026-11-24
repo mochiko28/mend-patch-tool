@@ -46,18 +46,18 @@ function invalidFilesystemPath(error: unknown): boolean {
 
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
 class Tree {
-  private readonly orig = new Map<string, string | null>();
+  private readonly orig = new Map<string, FileContent | null>();
   private readonly originalDirectories = new Set<string>();
   private readonly createdDirectories = new Set<string>();
   private readonly invalidPaths = new Set<string>();
-  readonly now = new Map<string, string | JsonLineText | null>();
+  readonly now = new Map<string, FileContent | null>();
   readonly moves: { from: string; to: string }[] = [];
-  original(p: string): string | null {
+  original(p: string): FileContent | null {
     if (!this.orig.has(p)) {
-      let v: string | null = null;
+      let v: FileContent | null = null;
       try {
         const stat = statSync(p);
-        if (stat.isFile()) v = readFileSync(p, 'utf8');
+        if (stat.isFile()) v = new FileContent(readFileSync(p, 'utf8'));
         else if (stat.isDirectory()) this.originalDirectories.add(p);
       } catch (error) {
         if (invalidFilesystemPath(error)) this.invalidPaths.add(p);
@@ -66,15 +66,12 @@ class Tree {
     }
     return this.orig.get(p)!;
   }
-  get(p: string): string | null {
-    return this.content(p)?.toString() ?? null;
-  }
-  content(p: string): string | JsonLineText | null {
+  content(p: string): FileContent | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
   }
 
   requireAbsent(p: string, movingFrom?: string): void {
-    if (this.get(p) !== null || this.originalDirectories.has(p) || this.createdDirectories.has(p)) {
+    if (this.content(p) !== null || this.originalDirectories.has(p) || this.createdDirectories.has(p)) {
       throw new Fail('exists', p);
     }
     if (this.invalidPaths.has(p)) throw new Fail('unsafe', p);
@@ -82,7 +79,7 @@ class Tree {
     const names = [basename(p)];
     let parent = dirname(p);
     while (parent !== '.') {
-      if (parent !== movingFrom && this.get(parent) !== null) throw new Fail('exists', parent);
+      if (parent !== movingFrom && this.content(parent) !== null) throw new Fail('exists', parent);
       if (this.originalDirectories.has(parent)) break;
       names.push(basename(parent));
       parent = dirname(parent);
@@ -100,8 +97,8 @@ class Tree {
     }
   }
 
-  write(p: string, text: string): void {
-    this.now.set(p, text);
+  write(p: string, content: FileContent): void {
+    this.now.set(p, content);
     for (let parent = dirname(p); parent !== '.'; parent = dirname(parent)) {
       this.createdDirectories.add(parent);
     }
@@ -129,14 +126,14 @@ function checkPath(path: string): void {
   if (!safe(path)) throw new Fail('unsafe', path);
 }
 
-function existingText(tree: Tree, path: string): string {
-  const text = tree.get(path);
-  if (text === null) throw new Fail('missing', path);
-  return text;
+function existingContent(tree: Tree, path: string): FileContent {
+  const content = tree.content(path);
+  if (content === null) throw new Fail('missing', path);
+  return content;
 }
 
-function saveEdit(tree: Tree, from: string, to: string, text: string): void {
-  tree.write(to, text);
+function saveEdit(tree: Tree, from: string, to: string, content: FileContent): void {
+  tree.write(to, content);
   if (from !== to) {
     tree.now.set(from, null);
     tree.moves.push({ from, to });
@@ -144,26 +141,143 @@ function saveEdit(tree: Tree, from: string, to: string, text: string): void {
 }
 
 type LineIndex = Map<string, Set<number>>;
+const jsonSuffixLength = 4;
 
-interface SplitFile {
-  lines: string[];
+interface FileLines {
+  lines: readonly string[];
   br: string;
   finalBreak: boolean;
+}
+
+interface SplitFile extends FileLines {
+  lines: string[];
   normalized?: [(string | undefined)[]?, (string | undefined)[]?];
   indexes?: LineIndex[];
 }
 
-function splitFile(text: string, indexMatches = false): SplitFile {
+function lineBreak(text: string): string {
   const nl = text.indexOf('\n');
-  const br = nl > 0 && text[nl - 1] === '\r' ? '\r\n' : '\n';
+  return nl > 0 && text[nl - 1] === '\r' ? '\r\n' : '\n';
+}
+
+function splitFile(text: string, br = lineBreak(text)): FileLines {
   const finalBreak = text.endsWith(br);
   const lines = text === '' ? [] : text.split(br);
   if (finalBreak) lines.pop();
-  return { lines, br, finalBreak, indexes: indexMatches ? [] : undefined };
+  return { lines, br, finalBreak };
 }
 
-function joinFile(lines: string[], br = '\n', finalBreak = true): string {
+function joinFile(lines: readonly string[], br = '\n', finalBreak = true): string {
   return lines.length === 0 ? '' : lines.join(br) + (finalBreak ? br : '');
+}
+
+interface JsonText {
+  lf: string;
+  crlf: boolean;
+}
+
+/** A tree value caches representations of the same content. Edits own their working arrays. */
+class FileContent {
+  private raw?: string;
+  private parsed?: FileLines;
+  private json?: JsonText;
+  private suffixes?: LineIndex;
+
+  constructor(content: string | FileLines | JsonText) {
+    if (typeof content === 'string') this.raw = content;
+    else if ('lines' in content) this.parsed = content;
+    else this.json = content;
+  }
+
+  static fromLines(lines: readonly string[], br = '\n', finalBreak = true): FileContent {
+    if (lines.length === 0) return new FileContent('');
+    const first = lines[0]!;
+    if (lines.length === 1 && !finalBreak) return new FileContent(first);
+    // A line edit can expose a different first break or leave a separator at EOF.
+    // Cache only the split that the next edit would get from the joined text.
+    if (br === '\n' ? first.endsWith('\r') : first.includes('\n')) {
+      return new FileContent(joinFile(lines, br, finalBreak));
+    }
+    if (!finalBreak && lines.at(-1) === '') {
+      return new FileContent({ lines: lines.slice(0, -1), br, finalBreak: true });
+    }
+    return new FileContent({ lines, br, finalBreak });
+  }
+
+  static fromJson(lf: string, crlf: boolean): FileContent {
+    // With no newline the next edit will detect LF, even after a CRLF edit.
+    return crlf && lf.includes('\n') ? new FileContent({ lf, crlf }) : new FileContent(lf);
+  }
+
+  text(): string {
+    if (this.raw === undefined) {
+      if (this.parsed !== undefined) {
+        const { lines, br, finalBreak } = this.parsed;
+        this.raw = joinFile(lines, br, finalBreak);
+      } else {
+        this.raw = this.json!.lf.replaceAll('\n', '\r\n');
+      }
+    }
+    return this.raw;
+  }
+
+  split(): FileLines {
+    if (this.parsed === undefined) {
+      this.parsed = this.raw !== undefined
+        ? splitFile(this.raw)
+        : { ...splitFile(this.json!.lf, '\n'), br: '\r\n' };
+    }
+    return this.parsed;
+  }
+
+  copyLines(indexMatches = false): SplitFile {
+    const file = this.split();
+    return { ...file, lines: file.lines.slice(), indexes: indexMatches ? [] : undefined };
+  }
+
+  jsonText(): JsonText {
+    if (this.json === undefined) {
+      const text = this.text();
+      const crlf = lineBreak(text) === '\r\n';
+      this.json = { lf: crlf ? text.replaceAll('\r\n', '\n') : text, crlf };
+    }
+    return this.json;
+  }
+
+  replaceJsonSuffix(path: string, oldSuffix: string, newSuffix: string): FileContent | undefined {
+    if (this.suffixes === undefined) {
+      if (this.json?.crlf) return undefined;
+      const text = this.text();
+      if (text.length < 65536 || text.includes('\r')) return undefined;
+      const { lines, finalBreak } = this.split();
+      const suffixes: LineIndex = new Map();
+      const count = lines.length - (finalBreak ? 0 : 1);
+      for (let i = 0; i < count; i += 1) {
+        addLinePosition(suffixes, lines[i]!.slice(-jsonSuffixLength), i);
+      }
+      this.suffixes = suffixes;
+    }
+    const key = oldSuffix.slice(-jsonSuffixLength);
+    const { lines, br, finalBreak } = this.split();
+    let at: number | undefined;
+    for (const i of this.suffixes.get(key) ?? []) {
+      if (!lines[i]!.endsWith(oldSuffix)) continue;
+      if (at !== undefined) throw new Fail('ambiguous', path);
+      at = i;
+    }
+    if (at === undefined) throw new Fail('no-match', path);
+
+    const line = lines[at]!;
+    const written = line.slice(0, line.length - oldSuffix.length) + newSuffix;
+    const updated = lines.slice();
+    updated[at] = written;
+    const result = FileContent.fromLines(updated, br, finalBreak);
+    // The old value keeps its lines and can rebuild the index if needed.
+    result.suffixes = this.suffixes;
+    this.suffixes = undefined;
+    moveLinePosition(result.suffixes, key, written.slice(-jsonSuffixLength), at);
+    return result;
+  }
 }
 
 const leadingIndent = (line: string): string => /^[ \t]*/.exec(line)![0];
@@ -220,6 +334,10 @@ function findMatches(
         if (at >= start && at <= end && matchesRest(at)) positions.push(at);
       }
       positions.sort((a, b) => a - b);
+    } else if (tier === 0 && first !== undefined && end === lines.length - wanted.length) {
+      for (let at = lines.indexOf(first, start); at !== -1 && at <= end; at = lines.indexOf(first, at + 1)) {
+        if (matchesRest(at)) positions.push(at);
+      }
     } else {
       for (let at = start; at <= end; at += 1) {
         if (first !== undefined && first !== (before[at] ?? (before[at] = normalize(lines[at]!)))) continue;
@@ -323,15 +441,15 @@ function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
       checkPath(path);
       if (old.length === 0) {
         tree.requireAbsent(path);
-        tree.write(path, joinFile(replacement));
+        tree.write(path, FileContent.fromLines(replacement));
         return;
       }
-      const file = splitFile(existingText(tree, path));
+      const file = existingContent(tree, path).copyLines();
       const match = findMatches(file, old, strict);
       if (match === null) throw new Fail('no-match', path);
       if (match.positions.length > 1) throw new Fail('ambiguous', path);
       replaceLines(file, change, match.positions[0]!, match.tier);
-      tree.now.set(path, joinFile(file.lines, file.br, file.finalBreak));
+      tree.now.set(path, FileContent.fromLines(file.lines, file.br, file.finalBreak));
     });
     previousPath = path;
     candidate = undefined;
@@ -377,36 +495,40 @@ function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
       checkPath(path);
       tree.requireAbsent(path);
       const additions = section.hunks.flatMap((hunk) => hunk.replacement.filter((line) => line.context === undefined));
-      tree.write(path, joinFile(additions.map((line) => line.text), '\n', !additions.at(-1)?.noNewline));
+      tree.write(path, FileContent.fromLines(additions.map((line) => line.text), '\n', !additions.at(-1)?.noNewline));
       return;
     }
-    const before = existingText(tree, from);
+    const before = existingContent(tree, from);
     if (to === null || section.delete) {
       tree.now.set(from, null);
       return;
     }
     if (from !== to) tree.requireAbsent(to, from);
-    const file = splitFile(before, indexBatch(section.hunks));
+    const file = before.copyLines(indexBatch(section.hunks));
     let delta = 0;
     for (const hunk of section.hunks) {
       const { old, replacement } = hunk;
       let at = Math.max(0, Math.min(file.lines.length, hunk.start + delta));
       let tier = 0;
       if (old.length > 0) {
-        const match = findMatches(file, old, strict);
-        if (match === null) throw new Fail('no-match', from);
         const target = Math.max(0, Math.min(file.lines.length, hunk.start - 1 + delta));
-        at = match.positions[0]!;
-        for (const position of match.positions) {
-          if (Math.abs(position - target) < Math.abs(at - target)) at = position;
+        if (old.every((line, offset) => file.lines[target + offset] === line)) {
+          at = target;
+        } else {
+          const match = findMatches(file, old, strict);
+          if (match === null) throw new Fail('no-match', from);
+          at = match.positions[0]!;
+          for (const position of match.positions) {
+            if (Math.abs(position - target) < Math.abs(at - target)) at = position;
+          }
+          tier = match.tier;
         }
-        tier = match.tier;
       }
       if (at + old.length === file.lines.length) file.finalBreak = !replacement.at(-1)?.noNewline;
       replaceLines(file, hunk, at, tier);
       delta += replacement.length - old.length;
     }
-    saveEdit(tree, from, to, joinFile(file.lines, file.br, file.finalBreak));
+    saveEdit(tree, from, to, FileContent.fromLines(file.lines, file.br, file.finalBreak));
   };
 }
 
@@ -477,7 +599,7 @@ function v4aUpdate(lines: string[], start: number, end: number, path: string, st
   return (tree) => {
     checkPath(path);
     if (hasMove) checkPath(to);
-    const file = splitFile(existingText(tree, path), indexBatch(chunks));
+    const file = existingContent(tree, path).copyLines(indexBatch(chunks));
     if (hasMove) tree.requireAbsent(to, path);
     let cursor = 0;
     for (const chunk of chunks) {
@@ -498,7 +620,7 @@ function v4aUpdate(lines: string[], start: number, end: number, path: string, st
       replaceLines(file, chunk, at, tier);
       cursor = at + chunk.replacement.length;
     }
-    saveEdit(tree, path, to, joinFile(file.lines, file.br, file.finalBreak));
+    saveEdit(tree, path, to, FileContent.fromLines(file.lines, file.br, file.finalBreak));
   };
 }
 
@@ -532,13 +654,13 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
       edits.push((tree) => {
         checkPath(path);
         tree.requireAbsent(path);
-        tree.write(path, joinFile(added));
+        tree.write(path, FileContent.fromLines(added));
       });
     } else if (header[1] === 'Delete') {
       if (end > i + 1) parseError(i + 1);
       edits.push((tree) => {
         checkPath(path);
-        existingText(tree, path);
+        existingContent(tree, path);
         tree.now.set(path, null);
       });
     } else edits.push(v4aUpdate(lines, i, end, path, strict));
@@ -547,99 +669,55 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
   return edits;
 }
 
-const jsonSuffixLength = 4;
-
-// In LF text, a search with exactly one newline at its end can only match a line suffix.
-class JsonLineText {
-  private readonly lines: string[];
-  private readonly suffixes: LineIndex = new Map();
-
-  constructor(text: string) {
-    this.lines = text.split('\n');
-    for (let i = 0; i < this.lines.length - 1; i += 1) {
-      addLinePosition(this.suffixes, this.lines[i]!.slice(-jsonSuffixLength), i);
-    }
-  }
-
-  replace(path: string, oldSuffix: string, newSuffix: string): void {
-    const key = oldSuffix.slice(-jsonSuffixLength);
-    let at: number | undefined;
-    for (const i of this.suffixes.get(key) ?? []) {
-      if (!this.lines[i]!.endsWith(oldSuffix)) continue;
-      if (at !== undefined) throw new Fail('ambiguous', path);
-      at = i;
-    }
-    if (at === undefined) throw new Fail('no-match', path);
-
-    // Validate uniqueness before changing the text that the tree shares with its rollback snapshot.
-    const line = this.lines[at]!;
-    const written = line.slice(0, line.length - oldSuffix.length) + newSuffix;
-    this.lines[at] = written;
-    moveLinePosition(this.suffixes, key, written.slice(-jsonSuffixLength), at);
-  }
-
-  toString(): string {
-    return this.lines.join('\n');
-  }
-}
-
 /** One JSON edit object (SPEC.md section 9), or null when it is not one. */
 function jsonEdit(v: unknown): Edit | null {
   if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
   const p = o.path;
   if (typeof p !== 'string') return null;
-  const exists = (tree: Tree): string | JsonLineText => {
-    if (!safe(p)) throw new Fail('unsafe', p);
-    const t = tree.content(p);
-    if (t === null) throw new Fail('missing', p);
-    return t;
+  const exists = (tree: Tree): FileContent => {
+    checkPath(p);
+    return existingContent(tree, p);
   };
   if (o.command === 'create' && typeof o.file_text === 'string') {
     const text = o.file_text;
     return (tree) => {
       checkPath(p);
       tree.requireAbsent(p);
-      tree.write(p, text);
+      tree.write(p, new FileContent(text));
     };
   }
   if (o.command === 'str_replace' && typeof o.old_str === 'string' && o.old_str !== '' && (o.new_str === undefined || typeof o.new_str === 'string')) {
     const oldStr = o.old_str;
     const newStr = (o.new_str as string | undefined) ?? '';
+    // In LF text this search can only match a line suffix, and the edit keeps line positions.
     const replaceSuffix = oldStr.length > jsonSuffixLength && oldStr.indexOf('\n') === oldStr.length - 1
       && newStr.endsWith('\n') && newStr.indexOf('\n') === newStr.length - 1 && !newStr.includes('\r');
     return (tree) => {
       const content = exists(tree);
-      if (replaceSuffix) {
-        const indexed = typeof content !== 'string' ? content
-          : content.length >= 65536 && !content.includes('\r') ? new JsonLineText(content) : undefined;
-        if (indexed !== undefined) {
-          indexed.replace(p, oldStr.slice(0, -1), newStr.slice(0, -1));
-          tree.now.set(p, indexed);
-          return;
-        }
+      const indexed = replaceSuffix ? content.replaceJsonSuffix(p, oldStr.slice(0, -1), newStr.slice(0, -1)) : undefined;
+      if (indexed !== undefined) {
+        tree.now.set(p, indexed);
+        return;
       }
-      const before = content.toString();
-      const nl = before.indexOf('\n');
-      const crlf = nl > 0 && before[nl - 1] === '\r';
+      const { lf: t, crlf } = content.jsonText();
       const lf = (s: string): string => (crlf ? s.replaceAll('\r\n', '\n') : s);
-      const t = lf(before);
       const old = lf(oldStr);
       const at = t.indexOf(old);
       if (at < 0) throw new Fail('no-match', p);
       if (t.indexOf(old, at + 1) >= 0) throw new Fail('ambiguous', p);
       const out = t.slice(0, at) + lf(newStr) + t.slice(at + old.length);
-      tree.now.set(p, crlf ? out.replaceAll('\n', '\r\n') : out);
+      tree.now.set(p, FileContent.fromJson(out, crlf));
     };
   }
   if (o.command === 'insert' && typeof o.insert_line === 'number' && Number.isInteger(o.insert_line) && typeof o.new_str === 'string') {
     const line = o.insert_line;
     const add = patchLines(o.new_str);
     return (tree) => {
-      const { lines, br, finalBreak } = splitFile(exists(tree).toString());
+      const { lines, br, finalBreak } = exists(tree).split();
       if (line < 0 || line > lines.length) throw new Fail('no-match', p);
       const result = lines.slice(0, line).concat(add, lines.slice(line));
-      tree.now.set(p, joinFile(result, br, finalBreak));
+      tree.now.set(p, FileContent.fromLines(result, br, finalBreak));
     };
   }
   return null;
@@ -736,15 +814,15 @@ function run(args: string[]): { code: number; out: string[] } {
   const renamedTo = new Map<string, string>();
   for (const { from, to } of tree.moves) {
     if (renamedFrom.has(from) || renamedTo.has(to)) continue;
-    if (tree.original(from) !== null && tree.get(from) === null && tree.original(to) === null && tree.get(to) !== null) {
+    if (tree.original(from) !== null && tree.content(from) === null && tree.original(to) === null && tree.content(to) !== null) {
       renamedFrom.add(from);
       renamedTo.set(to, from);
     }
   }
   const rows: string[] = [];
   for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
-    const was = tree.original(p);
-    const now = tree.get(p);
+    const was = tree.original(p)?.text() ?? null;
+    const now = tree.content(p)?.text() ?? null;
     if (was === now) continue;
     const from = renamedTo.get(p);
     if (from !== undefined) rows.push(`R ${from} -> ${p}`);
